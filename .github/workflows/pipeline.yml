@@ -1,0 +1,146 @@
+name: Smart Terraform Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  detect-changes:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    outputs:
+      run_payment: ${{ steps.set.outputs.run_payment }}
+      run_user: ${{ steps.set.outputs.run_user }}
+      skip_terraform: ${{ steps.set.outputs.skip_terraform }}
+      components_json: ${{ steps.set.outputs.components_json }}
+      run_plan_job: ${{ steps.set.outputs.run_plan_job }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get changed files
+        id: changed
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE="${{ github.event.pull_request.base.sha }}"
+          else
+            BASE="${{ github.event.before }}"
+            [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ] && BASE="HEAD~1"
+          fi
+          git diff --name-only "$BASE" HEAD 2>/dev/null > changed.txt || true
+          [ -s changed.txt ] || git diff --name-only HEAD~1 HEAD 2>/dev/null > changed.txt || true
+          sort -u changed.txt > changed_uniq.txt
+          cat changed_uniq.txt
+
+      - name: Set pipeline flags
+        id: set
+        run: |
+          CHANGED="$(cat changed_uniq.txt)"
+          PAYMENT=0
+          USER=0
+          ROOT=0
+          GLOBAL_IAM=0
+          ONLY_CHANGELOG=0
+
+          if [ -z "$CHANGED" ]; then
+            echo "No changed files (e.g. merge commit), run root plan"
+            ROOT=1
+          else
+            while IFS= read -r f; do
+              [ -z "$f" ] && continue
+              case "$f" in
+                apps/payment-api/*) PAYMENT=1 ;;
+                apps/user-api/*)   USER=1 ;;
+                global/iam/*)     GLOBAL_IAM=1 ;;
+                CHANGELOG.md)     ;;
+                *.tf|*.tfvars|modules/*|.github/workflows/*) ROOT=1 ;;
+                *)               ONLY_CHANGELOG=-1 ;;
+              esac
+            done < changed_uniq.txt
+            if [ "$(wc -l < changed_uniq.txt)" = "1" ] && grep -q '^CHANGELOG.md$' changed_uniq.txt; then
+              ONLY_CHANGELOG=1
+            fi
+          fi
+
+          [ "$GLOBAL_IAM" = "1" ] && PAYMENT=1 && USER=1
+
+          [ "$PAYMENT" = "1" ] && echo "run_payment=true" >> "$GITHUB_OUTPUT" || echo "run_payment=false" >> "$GITHUB_OUTPUT"
+          [ "$USER" = "1" ] && echo "run_user=true" >> "$GITHUB_OUTPUT" || echo "run_user=false" >> "$GITHUB_OUTPUT"
+          [ "$ONLY_CHANGELOG" = "1" ] && echo "skip_terraform=true" >> "$GITHUB_OUTPUT" || echo "skip_terraform=false" >> "$GITHUB_OUTPUT"
+
+          COMPONENTS='[]'
+          if [ "$PAYMENT" = "1" ] || [ "$USER" = "1" ]; then
+            [ "$PAYMENT" = "1" ] && COMPONENTS='["payment-api"]'
+            [ "$USER" = "1" ] && COMPONENTS='["user-api"]'
+            [ "$PAYMENT" = "1" ] && [ "$USER" = "1" ] && COMPONENTS='["payment-api","user-api"]'
+          elif [ "$ROOT" = "1" ]; then
+            COMPONENTS='["root"]'
+          fi
+          echo "components_json=$COMPONENTS" >> "$GITHUB_OUTPUT"
+          RUN_PLAN=false
+          [ "$ONLY_CHANGELOG" != "1" ] && [ "$PAYMENT" = "1" -o "$USER" = "1" -o "$ROOT" = "1" ] && RUN_PLAN=true
+          echo "run_plan_job=$RUN_PLAN" >> "$GITHUB_OUTPUT"
+
+  exit-ok:
+    name: No Terraform needed
+    if: ${{ needs.detect-changes.outputs.skip_terraform == 'true' }}
+    needs: detect-changes
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Only documentation changed (e.g. CHANGELOG.md). Skipping Terraform." && exit 0
+
+  plan:
+    name: Plan (${{ matrix.component }})
+    if: ${{ needs.detect-changes.outputs.run_plan_job == 'true' }}
+    needs: detect-changes
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        component: ${{ fromJson(needs.detect-changes.outputs.components_json) }}
+    defaults:
+      run:
+        working-directory: ${{ matrix.component == 'root' && '.' || format('apps/{0}', matrix.component) }}
+    env:
+      TF_VAR_environment: ${{ vars.TF_VAR_environment }}
+      TF_VAR_project_name: ${{ vars.TF_VAR_project_name }}
+      TF_VAR_db_password: ${{ secrets.TF_VAR_db_password }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-2' }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.5.0"
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        run: terraform init -input=false -backend=false
+        continue-on-error: true
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          terraform plan -no-color -input=false -out=tfplan 2>&1 | tee plan.txt
+          echo "exitcode=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+        continue-on-error: true
+
+      - name: Write Plan to Job Summary
+        run: |
+          echo "## Terraform Plan: ${{ matrix.component }}" >> "$GITHUB_STEP_SUMMARY"
+          echo '```hcl' >> "$GITHUB_STEP_SUMMARY"
+          cat plan.txt >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || echo "(no plan output)" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+        if: always()
