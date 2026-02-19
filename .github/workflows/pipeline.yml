@@ -98,7 +98,7 @@ jobs:
     if: ${{ needs.detect-changes.outputs.run_plan_job == 'true' }}
     needs: detect-changes
     runs-on: ubuntu-latest
-    environment: AWS_ACCESS_KEY_ID
+    environment: dev
     strategy:
       fail-fast: false
       matrix:
